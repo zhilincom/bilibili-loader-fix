@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Bilibili 断片修复 · 暂停等待加载
-// @namespace    https://github.com/bilibili-loader-fix
+// @namespace    https://github.com/zhilincom/bilibili-loader-fix
 // @version      1.0.0
 // @description  阻止 B 站播放器跳过未加载的视频片段，改为暂停等待；分片加载失败自动重试，超过 10 次弹窗询问是否继续。
-// @author       bilibili-loader-fix
+// @author       Lone
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/play/*
 // @match        https://www.bilibili.com/list/*
