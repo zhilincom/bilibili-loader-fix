@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 断片修复 · 暂停等待加载
 // @namespace    https://github.com/zhilincom/bilibili-loader-fix
-// @version      1.0.0
-// @description  阻止 B 站播放器跳过未加载的视频片段，改为暂停等待；分片加载失败自动重试，超过 10 次弹窗询问是否继续。
+// @version      1.1.0
+// @description  阻止 B 站播放器跳过未加载的视频片段，改为暂停等待；分片加载失败自动重试，超过 10 次弹窗询问是否继续；支持全屏自动隐藏、运行统计和油猴菜单控制。
 // @author       Lone
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/play/*
@@ -10,12 +10,18 @@
 // @match        https://www.bilibili.com/medialist/play/*
 // @match        https://www.bilibili.com/cheese/play/*
 // @run-at       document-start
-// @grant        none
+// @grant        unsafeWindow
+// @grant        GM_registerMenuCommand
 // @license      MIT
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  // @grant 模式下脚本运行在油猴沙箱中，必须通过 unsafeWindow 访问页面的
+  // pageWindow.dashjs / pageWindow.HTMLMediaElement 等对象；@grant none 时回退到 window。
+  const pageWindow = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+  const pageDocument = pageWindow.document;
 
   /* =========================================================================
    * 说明
@@ -27,15 +33,16 @@
    * "Gap has been predicted"），于是观众看到的就是“直接跳过一段”。
    *
    * 本脚本做三件事：
-   *   1. 接管 window.dashjs.MediaPlayer 创建的实例，强制关闭 jumpGaps，
+   *   1. 接管 pageWindow.dashjs.MediaPlayer 创建的实例，强制关闭 jumpGaps，
    *      从源头阻止“预判跳段”。
    *   2. 把分片重试次数提高到 10 次（可配置），并监听 requestRetryed；
    *      达到上限后弹窗询问是否继续重试。
-   *   3. 在 HTMLMediaElement.currentTime 上做兜底拦截：如果播放器仍然
+   *   3. 在 pageWindow.HTMLMediaElement.currentTime 上做兜底拦截：如果播放器仍然
    *      试图跳过未加载区间，就暂停并等待，而不是让它跳过去。
    * ======================================================================= */
 
   const STORAGE_KEY = 'bili_loader_fix_config_v1';
+  const STATS_KEY = 'bili_loader_fix_stats_v1';
   const LOG_PREFIX = '[BiliFix]';
 
   const DEFAULTS = Object.freeze({
@@ -53,7 +60,7 @@
   const state = {
     core: null,                 // dash.js 核心实例
     video: null,                // 当前 video 元素
-    player: null,               // window.player
+    player: null,               // pageWindow.player
     pendingGap: null,           // { from, to, at, reason }
     wasPlaying: false,
     watchdog: null,
@@ -67,7 +74,9 @@
     statusTimer: null,
     lastGapCheck: 0,
     lastStatus: '',
-    stats: { retries: 0, gaps: 0, blocked: 0 },
+    stats: loadStats(),
+    fullscreenHidden: false,
+    lastFullscreenState: null,
     ui: { bar: null, panel: null, dialog: null },
   };
 
@@ -97,7 +106,7 @@
   function loadConfig() {
     const cfg = Object.assign({}, DEFAULTS);
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = pageWindow.localStorage.getItem(STORAGE_KEY);
       if (!raw) return cfg;
       const parsed = JSON.parse(raw);
       for (const key of Object.keys(DEFAULTS)) {
@@ -114,20 +123,77 @@
 
   function saveConfig() {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+      pageWindow.localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
     } catch (err) {
       /* 忽略写入失败 */
     }
   }
 
+  function loadStats() {
+    const stats = { retries: 0, waits: 0, blocked: 0 };
+    try {
+      const raw = pageWindow.localStorage.getItem(STATS_KEY);
+      if (!raw) return stats;
+      const parsed = JSON.parse(raw);
+      stats.retries = Math.max(0, parseInt(parsed.retries, 10) || 0);
+      // 兼容 1.0.0 的 gaps 字段。
+      stats.waits = Math.max(0, parseInt(parsed.waits, 10) || parseInt(parsed.gaps, 10) || 0);
+      stats.blocked = Math.max(0, parseInt(parsed.blocked, 10) || 0);
+    } catch (err) {
+      /* 统计读取失败时从 0 开始 */
+    }
+    return stats;
+  }
+
+  function saveStats() {
+    try {
+      pageWindow.localStorage.setItem(STATS_KEY, JSON.stringify(state.stats));
+    } catch (err) {
+      /* 忽略写入失败 */
+    }
+  }
+
+  function defaultStatusText() {
+    return '断片守护 · 重试 ' + state.stats.retries + ' · 等待 ' + state.stats.waits;
+  }
+
+  function bumpStat(key) {
+    if (!state.stats || typeof state.stats[key] !== 'number') return;
+    state.stats[key] += 1;
+    saveStats();
+    updateStatsUI();
+    // 当前状态条显示的是默认文本时，同步刷新统计数字。
+    if (!state.lastStatus || state.lastStatus.indexOf('断片守护') === 0) {
+      showStatus(defaultStatusText(), 'ok', 0);
+    }
+  }
+
+  function resetStats() {
+    state.stats = { retries: 0, waits: 0, blocked: 0 };
+    saveStats();
+    updateStatsUI();
+    showStatus('统计计数已重置', 'ok', 3000);
+  }
+
+  function updateStatsUI() {
+    if (!state.ui.panel) return;
+    const set = (id, value) => {
+      const el = state.ui.panel.querySelector('#' + id);
+      if (el) el.textContent = String(value);
+    };
+    set('bili-fix-stat-retries', state.stats.retries);
+    set('bili-fix-stat-waits', state.stats.waits);
+    set('bili-fix-stat-blocked', state.stats.blocked);
+  }
+
   function getVideo() {
     if (state.video && state.video.isConnected) return state.video;
-    return document.querySelector('video');
+    return pageDocument.querySelector('video');
   }
 
   function getPlayer() {
     try {
-      return window.player || null;
+      return pageWindow.player || null;
     } catch (err) {
       return null;
     }
@@ -185,8 +251,8 @@
    * ======================================================================= */
 
   function injectStyles() {
-    if (document.getElementById('bili-fix-style')) return;
-    const style = document.createElement('style');
+    if (pageDocument.getElementById('bili-fix-style')) return;
+    const style = pageDocument.createElement('style');
     style.id = 'bili-fix-style';
     style.textContent = `
       #bili-fix-bar {
@@ -262,6 +328,35 @@
         display: flex !important; gap: 8px !important; margin-top: 14px !important;
       }
       #bili-fix-panel .bili-fix-actions button { flex: 1 !important; }
+      #bili-fix-panel .bili-fix-stats {
+        margin: 10px 0 12px !important;
+        padding: 10px 12px !important;
+        border-radius: 8px !important;
+        background: #202124 !important;
+        border: 1px solid rgba(255,255,255,.05) !important;
+      }
+      #bili-fix-panel .bili-fix-stats-title {
+        margin-bottom: 6px !important;
+        color: #9499a0 !important;
+        font-size: 11px !important;
+        letter-spacing: .04em !important;
+      }
+      #bili-fix-panel .bili-fix-stat-row {
+        display: flex !important;
+        justify-content: space-between !important;
+        gap: 12px !important;
+        margin: 4px 0 !important;
+        color: #c9ccd0 !important;
+        font-size: 12px !important;
+      }
+      #bili-fix-panel .bili-fix-stat-row strong {
+        color: #fb7299 !important;
+        font-weight: 600 !important;
+      }
+      #bili-fix-panel .bili-fix-reset-stats {
+        margin-top: 8px !important;
+        width: 100% !important;
+      }
       #bili-fix-panel .bili-fix-hint {
         margin-top: 10px !important; padding-top: 10px !important;
         border-top: 1px solid rgba(255,255,255,.06) !important;
@@ -325,17 +420,35 @@
         gap: 8px !important;
       }
     `;
-    (document.head || document.documentElement).appendChild(style);
+    (pageDocument.head || pageDocument.documentElement).appendChild(style);
+  }
+
+  function getFullscreenElement() {
+    return pageDocument.fullscreenElement ||
+      pageDocument.webkitFullscreenElement ||
+      pageDocument.mozFullScreenElement ||
+      pageDocument.msFullscreenElement ||
+      null;
+  }
+
+  function isFullscreen() {
+    if (getFullscreenElement()) return true;
+    // B 站部分场景使用 CSS 全屏，不触发 Fullscreen API。
+    const container = pageDocument.querySelector('.bpx-player-container, #bilibili-player');
+    if (container && typeof container.className === 'string') {
+      return /(?:^|\s)(?:bpx-player-container-fullscreen|bpx-player-fullscreen|bilibili-player-fullscreen)(?:\s|$)/.test(container.className);
+    }
+    return false;
   }
 
   function mountOverlay(el) {
     if (!el) return;
-    const fullscreen = document.fullscreenElement;
+    const fullscreen = getFullscreenElement();
     // 原生 video 全屏时把 UI 挂进 video 内部不可见，继续放在 body 上；
     // B 站自定义全屏时 fullscreenElement 是播放器容器，挂进去才能显示。
     const parent = (fullscreen && fullscreen.tagName !== 'VIDEO')
       ? fullscreen
-      : (document.body || document.documentElement);
+      : (pageDocument.body || pageDocument.documentElement);
     if (el.parentElement !== parent) parent.appendChild(el);
   }
 
@@ -345,14 +458,14 @@
 
   function createStatusBar() {
     if (state.ui.bar) return;
-    const bar = document.createElement('div');
+    const bar = pageDocument.createElement('div');
     bar.id = 'bili-fix-bar';
     bar.title = '点击打开 Bili 断片守护设置（Alt+B）';
     bar.innerHTML = '<span class="bili-fix-dot"></span><span class="bili-fix-text">断片守护</span><span class="bili-fix-gear">⚙</span>';
     bar.addEventListener('click', toggleSettings);
     mountOverlay(bar);
     state.ui.bar = bar;
-    if (!config.showStatus) setBarVisible(false);
+    updateBarVisibility();
   }
 
   function setBarVisible(visible) {
@@ -362,9 +475,13 @@
     state.ui.bar.style.setProperty('display', visible ? 'flex' : 'none', 'important');
   }
 
+  function updateBarVisibility() {
+    setBarVisible(!!config.showStatus && !state.fullscreenHidden);
+  }
+
   function createSettingsPanel() {
     if (state.ui.panel) return;
-    const panel = document.createElement('div');
+    const panel = pageDocument.createElement('div');
     panel.id = 'bili-fix-panel';
     panel.style.display = 'none';
     panel.innerHTML = `
@@ -373,6 +490,13 @@
         <button class="bili-fix-btn bili-fix-btn-small" data-action="close">关闭</button>
       </div>
       <div class="bili-fix-panel-sub">播放器尝试跳过未加载片段时，暂停并等待。</div>
+      <div class="bili-fix-stats">
+        <div class="bili-fix-stats-title">运行统计</div>
+        <div class="bili-fix-stat-row"><span>触发重试</span><strong id="bili-fix-stat-retries">0</strong></div>
+        <div class="bili-fix-stat-row"><span>暂停等待</span><strong id="bili-fix-stat-waits">0</strong></div>
+        <div class="bili-fix-stat-row"><span>拦截跳段</span><strong id="bili-fix-stat-blocked">0</strong></div>
+        <button class="bili-fix-btn bili-fix-btn-small bili-fix-reset-stats" data-action="reset-stats">重置计数</button>
+      </div>
       <div class="bili-fix-row"><label for="bili-fix-max-retries">最大重试次数</label><input id="bili-fix-max-retries" type="number" min="1" max="100" step="1"></div>
       <div class="bili-fix-row"><label for="bili-fix-retry-interval">重试间隔（毫秒）</label><input id="bili-fix-retry-interval" type="number" min="200" max="10000" step="100"></div>
       <div class="bili-fix-row"><label for="bili-fix-wait-timeout">等待超时（秒）</label><input id="bili-fix-wait-timeout" type="number" min="5" max="120" step="1"></div>
@@ -391,10 +515,12 @@
       if (action === 'close') closeSettings();
       else if (action === 'save') saveSettingsFromPanel();
       else if (action === 'defaults') resetSettingsToDefaults();
+      else if (action === 'reset-stats') resetStats();
     });
     mountOverlay(panel);
     state.ui.panel = panel;
     syncPanelFromConfig();
+    updateStatsUI();
   }
 
   function syncPanelFromConfig() {
@@ -431,7 +557,7 @@
     config.debug = !!($('bili-fix-debug') && $('bili-fix-debug').checked);
     saveConfig();
     applyCoreSettings();
-    setBarVisible(config.showStatus);
+    updateBarVisibility();
     syncPanelFromConfig();
     closeSettings();
     showStatus('设置已保存', 'ok', 3000);
@@ -442,7 +568,7 @@
     Object.assign(config, DEFAULTS);
     saveConfig();
     applyCoreSettings();
-    setBarVisible(config.showStatus);
+    updateBarVisibility();
     syncPanelFromConfig();
     showStatus('已恢复默认设置', 'ok', 3000);
   }
@@ -456,6 +582,7 @@
   function openSettings() {
     if (!state.ui.panel) return;
     syncPanelFromConfig();
+    updateStatsUI();
     state.ui.panel.style.display = 'block';
     mountOverlay(state.ui.panel);
   }
@@ -487,7 +614,7 @@
         if (state.ui.bar && !state.pendingGap) {
           const textEl = state.ui.bar.querySelector('.bili-fix-text');
           const dot = state.ui.bar.querySelector('.bili-fix-dot');
-          if (textEl) textEl.textContent = '断片守护';
+          if (textEl) textEl.textContent = defaultStatusText();
           if (dot) dot.style.background = '#2ecc71';
         }
       }, duration);
@@ -541,16 +668,16 @@
 
         dashjs.MediaPlayer = WrappedMediaPlayer;
         dashjs.__biliFixPatched = true;
-        log('已接管 window.dashjs.MediaPlayer');
+        log('已接管 pageWindow.dashjs.MediaPlayer');
       } catch (err) {
-        warn('接管 window.dashjs 失败', err);
+        warn('接管 pageWindow.dashjs 失败', err);
       }
       return dashjs;
     }
 
     try {
-      current = window.dashjs;
-      Object.defineProperty(window, 'dashjs', {
+      current = pageWindow.dashjs;
+      Object.defineProperty(pageWindow, 'dashjs', {
         configurable: true,
         enumerable: true,
         get() {
@@ -561,18 +688,18 @@
         },
       });
     } catch (err) {
-      warn('无法拦截 window.dashjs 赋值，改用轮询', err);
+      warn('无法拦截 pageWindow.dashjs 赋值，改用轮询', err);
     }
 
     if (current) install(current);
 
-    // 某些情况下页面会用 Object.defineProperty 重新定义 window.dashjs，
+    // 某些情况下页面会用 Object.defineProperty 重新定义 pageWindow.dashjs，
     // 或者脚本注入较晚，这里用低频轮询兜底。
     let tries = 0;
     const timer = setInterval(() => {
       tries += 1;
       try {
-        if (window.dashjs && !window.dashjs.__biliFixPatched) install(window.dashjs);
+        if (pageWindow.dashjs && !pageWindow.dashjs.__biliFixPatched) install(pageWindow.dashjs);
       } catch (err) {
         /* ignore */
       }
@@ -677,11 +804,13 @@
   function onRequestRetryed(event) {
     const times = Number(event && event.retryTimes) || 0;
     const key = makeRetryKey(event);
-    state.stats.retries += 1;
     log('requestRetryed', times, event);
 
-    if (times > 0 && !state.pendingGap) {
-      showStatus('片段加载失败，正在重试 ' + times + '/' + config.maxRetries, 'warn', 3500);
+    if (times > 0) {
+      bumpStat('retries');
+      if (!state.pendingGap) {
+        showStatus('片段加载失败，正在重试 ' + times + '/' + config.maxRetries, 'warn', 3500);
+      }
     }
 
     if (times >= config.maxRetries && !state.retryDialogKeys.has(key)) {
@@ -735,7 +864,7 @@
    * ======================================================================= */
 
   function hookCurrentTime() {
-    const proto = HTMLMediaElement.prototype;
+    const proto = pageWindow.HTMLMediaElement.prototype;
     if (!proto || proto.__biliFixTimeHooked) return;
     const descriptor = Object.getOwnPropertyDescriptor(proto, 'currentTime');
     if (!descriptor || typeof descriptor.set !== 'function') return;
@@ -746,7 +875,7 @@
         enumerable: descriptor.enumerable,
         get: descriptor.get,
         set(value) {
-          if (this instanceof HTMLVideoElement) {
+          if (this instanceof pageWindow.HTMLVideoElement) {
             if (state.allowSeekOnce) {
               state.allowSeekOnce = false;
               return descriptor.set.call(this, value);
@@ -768,7 +897,7 @@
     if (typeof proto.fastSeek === 'function') {
       const originalFastSeek = proto.fastSeek;
       proto.fastSeek = function (time) {
-        if (this instanceof HTMLVideoElement && shouldBlockGapSeek(this, time)) {
+        if (this instanceof pageWindow.HTMLVideoElement && shouldBlockGapSeek(this, time)) {
           handleGapSeek(this, time);
           return;
         }
@@ -808,7 +937,7 @@
   }
 
   function handleGapSeek(video, target) {
-    state.stats.blocked += 1;
+    bumpStat('blocked');
     log('拦截跳段', video.currentTime, '->', target);
     pauseForGap(video, '已拦截播放器跳过未加载片段，暂停等待加载', target);
   }
@@ -831,7 +960,7 @@
       reason: reason || '检测到未加载片段',
     };
     state.wasPlaying = !video.paused;
-    state.stats.gaps += 1;
+    bumpStat('waits');
 
     try {
       video.pause();
@@ -999,28 +1128,28 @@
   }
 
   function renderDialog(options, done) {
-    const overlay = document.createElement('div');
+    const overlay = pageDocument.createElement('div');
     overlay.className = 'bili-fix-overlay';
 
-    const card = document.createElement('div');
+    const card = pageDocument.createElement('div');
     card.className = 'bili-fix-dialog';
 
-    const title = document.createElement('div');
+    const title = pageDocument.createElement('div');
     title.className = 'bili-fix-dialog-title';
     title.textContent = options.title || '提示';
 
-    const message = document.createElement('div');
+    const message = pageDocument.createElement('div');
     message.className = 'bili-fix-dialog-message';
     message.textContent = options.message || '';
 
-    const actions = document.createElement('div');
+    const actions = pageDocument.createElement('div');
     actions.className = 'bili-fix-dialog-actions';
 
     let settled = false;
     const finish = (value) => {
       if (settled) return;
       settled = true;
-      document.removeEventListener('keydown', onKey, true);
+      pageDocument.removeEventListener('keydown', onKey, true);
       overlay.remove();
       if (state.ui.dialog === overlay) state.ui.dialog = null;
       done(value);
@@ -1031,11 +1160,11 @@
         finish('cancel');
       }
     };
-    document.addEventListener('keydown', onKey, true);
+    pageDocument.addEventListener('keydown', onKey, true);
 
     const buttons = options.buttons || [{ text: '知道了', value: 'ok', primary: true }];
     for (const item of buttons) {
-      const button = document.createElement('button');
+      const button = pageDocument.createElement('button');
       button.className = 'bili-fix-btn' + (item.primary ? ' bili-fix-btn-primary' : '');
       button.textContent = item.text;
       button.addEventListener('click', () => finish(item.value));
@@ -1098,7 +1227,7 @@
       } else if (choice === 'skip') {
         skipGap(video);
       } else if (choice === 'reload') {
-        location.reload();
+        pageWindow.location.reload();
       } else {
         // Esc 或取消：保持暂停，允许用户稍后手动继续。
         showStatus('已暂停等待片段加载', 'warn', 0);
@@ -1151,7 +1280,7 @@
 
   function onPlaying() {
     if (state.pendingGap) return;
-    showStatus('断片守护', 'ok', 0);
+    showStatus(defaultStatusText(), 'ok', 0);
   }
 
   function onPlay() {
@@ -1241,11 +1370,11 @@
         markUserSeek();
       }
     };
-    window.addEventListener('pointerdown', onPointerDown, true);
-    window.addEventListener('mousedown', onPointerDown, true);
-    window.addEventListener('touchstart', onPointerDown, true);
+    pageWindow.addEventListener('pointerdown', onPointerDown, true);
+    pageWindow.addEventListener('mousedown', onPointerDown, true);
+    pageWindow.addEventListener('touchstart', onPointerDown, true);
 
-    window.addEventListener('keydown', (event) => {
+    pageWindow.addEventListener('keydown', (event) => {
       if (event.altKey && (event.key === 'b' || event.key === 'B')) {
         event.preventDefault();
         event.stopPropagation();
@@ -1257,15 +1386,49 @@
       }
     }, true);
 
-    document.addEventListener('fullscreenchange', onFullscreenChange);
-    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
-    window.addEventListener('pagehide', cleanup, { once: true });
+    pageDocument.addEventListener('fullscreenchange', onFullscreenChange);
+    pageDocument.addEventListener('webkitfullscreenchange', onFullscreenChange);
+    // B 站部分 CSS 全屏场景不触发 fullscreenchange，用 resize 兜底。
+    pageWindow.addEventListener('resize', onFullscreenChange);
+    pageWindow.addEventListener('pagehide', cleanup, { once: true });
   }
 
   function onFullscreenChange() {
+    const fullscreen = isFullscreen();
+    if (state.lastFullscreenState === fullscreen) {
+      if (state.ui.dialog) mountOverlay(state.ui.dialog);
+      return;
+    }
+    state.lastFullscreenState = fullscreen;
+    state.fullscreenHidden = fullscreen;
+    updateBarVisibility();
+    if (fullscreen) closeSettings();
     if (state.ui.bar) mountOverlay(state.ui.bar);
     if (state.ui.panel) mountOverlay(state.ui.panel);
     if (state.ui.dialog) mountOverlay(state.ui.dialog);
+  }
+
+  function setPageUIEnabled(enabled) {
+    config.showStatus = !!enabled;
+    saveConfig();
+    syncPanelFromConfig();
+    updateBarVisibility();
+    if (!enabled) {
+      closeSettings();
+    } else {
+      showStatus(defaultStatusText(), 'ok', 0);
+    }
+  }
+
+  function registerMenuCommands() {
+    if (typeof GM_registerMenuCommand !== 'function') return;
+    try {
+      GM_registerMenuCommand('显示 Bili 断片守护 UI', () => setPageUIEnabled(true));
+      GM_registerMenuCommand('隐藏 Bili 断片守护 UI', () => setPageUIEnabled(false));
+      GM_registerMenuCommand('重置断片统计', () => resetStats());
+    } catch (err) {
+      warn('注册油猴菜单失败', err);
+    }
   }
 
   function cleanup() {
@@ -1286,19 +1449,24 @@
     createSettingsPanel();
     bindGlobalEvents();
     onFullscreenChange();
-    if (state.core) showStatus('断片守护已启用', 'ok', 3000);
+    if (state.core) {
+      showStatus('断片守护已启用', 'ok', 3000);
+    } else {
+      showStatus(defaultStatusText(), 'ok', 0);
+    }
   }
 
   function init() {
-    if (window.__biliLoaderFixInjected) return;
-    window.__biliLoaderFixInjected = true;
+    if (pageWindow.__biliLoaderFixInjected) return;
+    pageWindow.__biliLoaderFixInjected = true;
 
+    registerMenuCommands();
     state.player = getPlayer();
     hookDashjs();
     hookCurrentTime();
 
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initUI, { once: true });
+    if (pageDocument.readyState === 'loading') {
+      pageDocument.addEventListener('DOMContentLoaded', initUI, { once: true });
     } else {
       initUI();
     }
@@ -1306,14 +1474,14 @@
     // 轮询 video：SPA 切分 P、切换清晰度时 video 元素可能被替换。
     const videoTimer = setInterval(() => {
       state.player = getPlayer();
-      const video = document.querySelector('video');
+      const video = pageDocument.querySelector('video');
       if (video && video !== state.video) bindVideo(video);
     }, 1000);
 
-    window.addEventListener('pagehide', () => clearInterval(videoTimer), { once: true });
+    pageWindow.addEventListener('pagehide', () => clearInterval(videoTimer), { once: true });
 
     // 方便高级用户在控制台调试。
-    window.__biliFix = {
+    pageWindow.__biliFix = {
       config,
       state,
       getVideo,
@@ -1326,6 +1494,13 @@
       saveConfig,
       openSettings,
       closeSettings,
+      setPageUIEnabled,
+      updateBarVisibility,
+      registerMenuCommands,
+      resetStats,
+      bumpStat,
+      updateStatsUI,
+      defaultStatusText,
     };
   }
 

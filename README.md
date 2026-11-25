@@ -2,6 +2,8 @@
 
 解决 B 站视频播放到中间某段时，因为分片没加载成功而**直接跳过**、导致声音和画面不连续的问题。脚本会把“跳过”改成“暂停等待加载”，并增强分片重试；同一片段重试超过 10 次后弹窗询问是否继续。
 
+此外还支持：全屏时自动隐藏右下角状态条、统计触发重试/暂停等待/拦截跳段的次数（可重置），以及通过油猴扩展菜单显示或隐藏页面 UI。
+
 - 脚本文件：`bilibili-loader-fix.user.js`
 - 适用页面：`www.bilibili.com/video/*`、`/bangumi/play/*`、`/list/*`、`/medialist/play/*`、`/cheese/play/*`
 - 运行时机：`document-start`（必须早于 B 站播放器脚本）
@@ -148,6 +150,12 @@ i.setJumpGaps(!0);   // true
   - **跳过这一段**
   - **刷新页面**
 
+### 附加能力：全屏隐藏、统计和油猴菜单
+
+- **全屏自动隐藏**：进入全屏时隐藏右下角状态条并关闭设置面板，退出全屏后按“显示右下角状态条”的配置恢复。重试/超时弹窗仍会在全屏中显示，避免错过交互提示。
+- **运行统计**：状态条默认显示“断片守护 · 重试 N · 等待 M”；设置面板中还会显示“触发重试 / 暂停等待 / 拦截跳段”三项计数，并提供“重置计数”按钮。统计保存在 `localStorage` 的 `bili_loader_fix_stats_v1` 中。
+- **油猴菜单**：左键单击油猴扩展图标，菜单中提供“显示 Bili 断片守护 UI”“隐藏 Bili 断片守护 UI”“重置断片统计”。菜单项控制常驻状态条和设置面板，临时弹窗不受影响。
+
 ---
 
 ## 三、安装
@@ -158,7 +166,7 @@ i.setJumpGaps(!0);   // true
 4. 打开任意 B 站视频页，右下角出现“断片守护”状态条即表示生效。
 5. 如果之前已经打开视频页，刷新一次页面。
 
-> 脚本使用 `@grant none`，必须运行在页面上下文中才能访问 `window.dashjs`。请不要改成 `@grant unsafeWindow` 以外的沙箱模式。
+> 脚本使用 `@grant unsafeWindow` 访问页面的 `window.dashjs`、`HTMLMediaElement` 等对象，并使用 `@grant GM_registerMenuCommand` 注册油猴菜单。请保留这两个 `@grant` 声明；如果改成 `@grant none`，油猴菜单不会出现，且脚本无法通过 `unsafeWindow` 访问页面播放器。
 
 ---
 
@@ -177,6 +185,28 @@ i.setJumpGaps(!0);   // true
 | 调试日志 | 关闭 | 开启后在控制台输出 `[BiliFix]` 日志 |
 
 配置保存在 `localStorage` 的 `bili_loader_fix_config_v1` 中，B 站页面之间共享。
+
+### 运行统计
+
+设置面板顶部显示三项统计：
+
+| 统计项 | 含义 |
+| --- | --- |
+| 触发重试 | 收到 `requestRetryed` 事件且 `retryTimes > 0` 的次数 |
+| 暂停等待 | 因缓冲空洞/跳段而进入暂停等待的次数 |
+| 拦截跳段 | `currentTime`/`fastSeek` 拦截跳段的次数 |
+
+点击“重置计数”或油猴菜单中的“重置断片统计”可清零。统计保存在 `localStorage` 的 `bili_loader_fix_stats_v1` 中，按站点累计。
+
+### 油猴菜单
+
+左键单击浏览器工具栏中的油猴扩展图标，菜单中会出现：
+
+- **显示 Bili 断片守护 UI**：显示右下角状态条（等价于在设置中勾选“显示右下角状态条”）
+- **隐藏 Bili 断片守护 UI**：隐藏状态条并关闭设置面板
+- **重置断片统计**：把三项统计清零
+
+如果菜单中没有这些项目，请确认脚本已启用，且管理器支持 `GM_registerMenuCommand`（Tampermonkey、Violentmonkey、ScriptCat 均支持）。
 
 ---
 
@@ -200,6 +230,20 @@ window.__biliFix.state.core?.getJumpGaps?.()
 // 确认 dash.js 是否已被接管
 window.dashjs?.__biliFixPatched
 
+// 运行统计
+window.__biliFix.state.stats
+
+// 手动增加/重置统计（调试用）
+window.__biliFix.bumpStat('retries')
+window.__biliFix.resetStats()
+
+// 显示/隐藏页面 UI
+window.__biliFix.setPageUIEnabled(false)
+window.__biliFix.setPageUIEnabled(true)
+
+// 刷新状态条和面板中的统计数字
+window.__biliFix.updateStatsUI()
+
 // 手动测试弹窗
 window.__biliFix.showRetryDialog(
   { url: 'test', range: '0-100', mediaType: 'video', retryTimes: 10 },
@@ -220,7 +264,9 @@ window.__biliFix.showRetryDialog(
 4. **长时间等待**：关闭 `jumpGaps` 后，如果缺失片段永远加载不上，视频会停在空洞前等待，直到超时弹窗。你可以选择“跳过这一段”继续观看。
 5. **直播/互动视频/DRM**：这些场景可能使用不同的播放路径，脚本未做针对性适配。
 6. **多个视频元素**：脚本只守护页面上被识别为主播放器的第一个 `video`；广告、预览等次要视频不会被拦截。
-7. **全屏 UI**：B 站自定义全屏时状态条和弹窗会跟随进入全屏；原生 video 全屏时 UI 会留在页面上，但视频本身不受影响。
+7. **全屏检测**：脚本通过 Fullscreen API（含 webkit 前缀）和 B 站播放器容器的全屏类名判断全屏状态。如果 B 站以后改用其他全屏实现，状态条可能不会自动隐藏；此时可用油猴菜单手动隐藏。
+8. **油猴菜单兼容性**：菜单项依赖 `GM_registerMenuCommand`。如果管理器不支持，菜单项不会出现，但仍可通过状态条或 `Alt+B` 打开设置面板。
+9. **统计持久化**：统计按站点保存在 `localStorage`，清除站点数据、换浏览器或使用隐私模式后会清零。
 
 ---
 
