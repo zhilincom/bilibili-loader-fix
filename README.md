@@ -288,3 +288,9 @@ window.__biliFix.showRetryDialog(
 ## 八、免责声明
 
 本脚本仅用于改善个人观看体验，不修改 B 站服务器数据，不绕过付费/DRM/地区限制。请遵守 B 站用户协议和当地法律法规。
+
+---
+
+## 九、开源协议
+
+本项目采用 [MIT License](LICENSE)。
