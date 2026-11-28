@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 断片修复 · 暂停等待加载
 // @namespace    https://github.com/zhilincom/bilibili-loader-fix
-// @version      1.1.1
+// @version      1.1.2
 // @description  阻止 B 站播放器跳过未加载的视频片段，改为暂停等待；分片加载失败自动重试，超过 10 次弹窗询问是否继续；支持全屏自动隐藏、运行统计和油猴菜单控制。
 // @author       Lone
 // @match        https://www.bilibili.com/video/*
@@ -155,7 +155,8 @@
   }
 
   function defaultStatusText() {
-    return '断片守护 · 重试 ' + state.stats.retries + ' · 等待 ' + state.stats.waits;
+    // 状态条只展示重试次数；暂停等待等统计保留在设置面板中。
+    return '断片守护 · 重试 ' + state.stats.retries;
   }
 
   function bumpStat(key) {
