@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 断片修复 · 暂停等待加载
 // @namespace    https://github.com/zhilincom/bilibili-loader-fix
-// @version      1.1.0
+// @version      1.1.1
 // @description  阻止 B 站播放器跳过未加载的视频片段，改为暂停等待；分片加载失败自动重试，超过 10 次弹窗询问是否继续；支持全屏自动隐藏、运行统计和油猴菜单控制。
 // @author       Lone
 // @match        https://www.bilibili.com/video/*
@@ -75,6 +75,7 @@
     lastGapCheck: 0,
     lastStatus: '',
     stats: loadStats(),
+    retrySendAt: new Map(),
     fullscreenHidden: false,
     lastFullscreenState: null,
     ui: { bar: null, panel: null, dialog: null },
@@ -906,6 +907,130 @@
     }
   }
 
+  /* =========================================================================
+   * XHR 分片重试间隔
+   * -------------------------------------------------------------------------
+   * dash.js 的 HTTPLoader 在部分错误分支（4xx/6xx、连接快速失败）里会把
+   * 重试延迟算成 0，setFragmentLoaderRetryInterval 覆盖不到，结果是重试
+   * 次数在几十毫秒内直接耗尽。这里 hook 分片 XHR：失败后记录下一次允许
+   * 发送的时间，dash.js 的下一次重试 send() 会被强制延迟到该时间之后。
+   * ======================================================================= */
+
+  function hookXhrRetry() {
+    const XHR = pageWindow.XMLHttpRequest;
+    if (!XHR || !XHR.prototype || XHR.prototype.__biliFixRetryHooked) return;
+    const proto = XHR.prototype;
+    proto.__biliFixRetryHooked = true;
+
+    const originalOpen = proto.open;
+    const originalSetRequestHeader = proto.setRequestHeader;
+    const originalSend = proto.send;
+    const originalAbort = proto.abort;
+
+    proto.open = function (method, url) {
+      const st = this.__biliFixReq || (this.__biliFixReq = {});
+      if (st.delayTimer) {
+        clearTimeout(st.delayTimer);
+        st.delayTimer = null;
+      }
+      st.method = method;
+      st.url = String(url == null ? '' : url);
+      st.headers = {};
+      st.range = '';
+      st.aborted = false;
+      st.isFragment = false;
+      st.key = '';
+      return originalOpen.apply(this, arguments);
+    };
+
+    proto.setRequestHeader = function (name, value) {
+      const st = this.__biliFixReq;
+      if (st) {
+        const lower = String(name).toLowerCase();
+        st.headers[lower] = String(value);
+        if (lower === 'range') st.range = String(value);
+      }
+      return originalSetRequestHeader.apply(this, arguments);
+    };
+
+    function markFragmentResult(xhr, kind) {
+      const st = xhr.__biliFixReq;
+      if (!st || !st.isFragment || st.aborted) return;
+      const status = xhr.status;
+      if (kind === 'load' && ((status >= 200 && status < 300) || status === 304)) {
+        state.retrySendAt.delete(st.key);
+        return;
+      }
+      if (kind !== 'load' || status === 0 || status >= 300) {
+        // 在 dash.js 的错误回调里安排重试之前先记下延迟。
+        state.retrySendAt.set(st.key, Date.now() + config.retryInterval);
+      }
+    }
+
+    function wrapCallback(xhr, prop, kind) {
+      const current = xhr[prop];
+      if (current && current.__biliFixWrapped) return;
+      const original = current;
+      const wrapped = function (event) {
+        markFragmentResult(xhr, kind);
+        if (typeof original === 'function') {
+          return original.call(xhr, event);
+        }
+      };
+      wrapped.__biliFixWrapped = true;
+      xhr[prop] = wrapped;
+    }
+
+    proto.send = function (body) {
+      const xhr = this;
+      const st = xhr.__biliFixReq;
+      if (!st) return originalSend.apply(xhr, arguments);
+
+      const url = st.url || '';
+      st.isFragment = /\.m4s(?:$|[?#])/i.test(url) || /upgcxcode/i.test(url);
+      st.key = url + '|' + (st.range || '');
+      if (!st.isFragment) return originalSend.apply(xhr, arguments);
+
+      // 必须在 dash.js 的 onload/onerror 回调执行前包装：它会在回调里
+      // 用 setTimeout(..., 0) 安排下一次重试，这里先把失败时间记下来。
+      wrapCallback(xhr, 'onload', 'load');
+      wrapCallback(xhr, 'onerror', 'error');
+      wrapCallback(xhr, 'ontimeout', 'timeout');
+
+      const now = Date.now();
+      const nextAllowed = state.retrySendAt.get(st.key) || 0;
+      if (now < nextAllowed) {
+        if (st.delayTimer) clearTimeout(st.delayTimer);
+        st.delayTimer = setTimeout(function () {
+          st.delayTimer = null;
+          if (st.aborted) return;
+          try {
+            originalSend.call(xhr, body);
+          } catch (err) {
+            warn('延迟重试发送失败', err);
+          }
+        }, nextAllowed - now);
+        return;
+      }
+
+      return originalSend.apply(xhr, arguments);
+    };
+
+    proto.abort = function () {
+      const st = this.__biliFixReq;
+      if (st) {
+        st.aborted = true;
+        if (st.delayTimer) {
+          clearTimeout(st.delayTimer);
+          st.delayTimer = null;
+        }
+      }
+      return originalAbort.apply(this, arguments);
+    };
+
+    log('已启用 XHR 分片重试间隔控制');
+  }
+
   function shouldBlockGapSeek(video, target) {
     if (!config.autoPauseOnGap) return false;
     if (!state.video || video !== state.video) return false;
@@ -1462,6 +1587,7 @@
 
     registerMenuCommands();
     state.player = getPlayer();
+    hookXhrRetry();
     hookDashjs();
     hookCurrentTime();
 

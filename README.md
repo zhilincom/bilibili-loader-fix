@@ -116,6 +116,7 @@ i.setJumpGaps(!0);   // true
 
 - 包装 `setFragmentLoaderRetryAttempts`，把分片重试次数至少抬到 **10 次**（可在设置面板修改）。
 - 固定重试间隔（默认 1000 ms）。
+- **在 XHR 层强制执行重试间隔**：dash.js 在部分错误分支（4xx/6xx、连接快速失败）会把重试延迟算成 0，`setFragmentLoaderRetryInterval` 覆盖不到，导致重试次数在几十毫秒内瞬间耗尽。脚本会 hook 分片 XHR，在 `onload` / `onerror` / `ontimeout` 回调入口记录失败时间，dash.js 随后发出的下一次重试 `send()` 会被强制延迟到“失败时间 + 重试间隔”之后。
 - 监听 `requestRetryed`：
   - 状态条显示“片段加载失败，正在重试 n/10”
   - 当 `retryTimes >= 10` 时弹窗：
@@ -177,7 +178,7 @@ i.setJumpGaps(!0);   // true
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | 最大重试次数 | 10 | 单个分片的最大重试次数；达到后弹窗 |
-| 重试间隔 | 1000 ms | dash.js 分片重试基础间隔 |
+| 重试间隔 | 1000 ms | 脚本在 XHR 层强制的最小重试间隔；dash.js 自身可能用 0 延迟重试，这里会兜底 |
 | 等待超时 | 15 秒 | 暂停等待超过该时间后弹窗 |
 | 关闭播放器预判跳段 | 开启 | 包装 `setJumpGaps`，强制关闭主动跳段 |
 | 检测到跳段时自动暂停 | 开启 | 启用 `currentTime` 拦截和前方空洞检测 |
@@ -267,6 +268,7 @@ window.__biliFix.showRetryDialog(
 7. **全屏检测**：脚本通过 Fullscreen API（含 webkit 前缀）和 B 站播放器容器的全屏类名判断全屏状态。如果 B 站以后改用其他全屏实现，状态条可能不会自动隐藏；此时可用油猴菜单手动隐藏。
 8. **油猴菜单兼容性**：菜单项依赖 `GM_registerMenuCommand`。如果管理器不支持，菜单项不会出现，但仍可通过状态条或 `Alt+B` 打开设置面板。
 9. **统计持久化**：统计按站点保存在 `localStorage`，清除站点数据、换浏览器或使用隐私模式后会清零。
+10. **XHR 重试间隔**：间隔控制通过 hook `XMLHttpRequest` 实现，覆盖 dash.js 当前的主播放路径。如果 B 站以后改用 `fetch` 加载分片，间隔控制可能失效。
 
 ---
 
